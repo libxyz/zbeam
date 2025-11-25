@@ -2,4 +2,9 @@
 const std = @import("std");
 
 pub const Chan = @import("chan/chan.zig").Chan;
-pub const ChanErr = @import("chan/chan.zig").ChanErr;
+pub const ChanErr = @import("chan/errs.zig").ChanErr;
+
+test {
+    // 这行代码会让 Zig 递归地去检查并运行上面所有被引用(public)容器里的测试
+    std.testing.refAllDecls(@This());
+}
