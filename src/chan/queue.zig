@@ -18,8 +18,8 @@ pub fn BoundedQueue(comptime T: type) type {
         capacity: usize,
         mask: usize,
         buffer: []Slot,
-        enqueue_pos: std.atomic.Value(u64) align(64) = .init(0),
-        dequeue_pos: std.atomic.Value(u64) align(64) = .init(0),
+        head: std.atomic.Value(u64) align(64) = .init(0),
+        tail: std.atomic.Value(u64) align(64) = .init(0),
 
         pub fn init(alloc: std.mem.Allocator, cap: usize) !*Self {
             const real_cap = std.math.ceilPowerOfTwo(usize, cap) catch unreachable;
@@ -32,7 +32,6 @@ pub fn BoundedQueue(comptime T: type) type {
             var i: usize = 0;
             while (i < real_cap) : (i += 1) {
                 buf[i].seq.store(@as(u64, i), .monotonic);
-                // Leave data uninitialized
             }
 
             self.* = .{
@@ -51,13 +50,13 @@ pub fn BoundedQueue(comptime T: type) type {
         pub fn tryEnqueue(self: *Self, value: T) bool {
             // Attempt to reserve a position if available by reading enqueue_pos and checking slot seq
             while (true) {
-                const pos = self.enqueue_pos.load(.acquire);
+                const pos = self.head.load(.acquire);
                 const idx = (@as(usize, pos) & self.mask);
                 var cell = &self.buffer[idx];
                 const seq = cell.seq.load(.acquire);
 
                 if (seq == pos) {
-                    const canEnqueue = self.enqueue_pos.cmpxchgWeak(pos, pos + 1, .acq_rel, .acquire) == null;
+                    const canEnqueue = self.head.cmpxchgWeak(pos, pos + 1, .acq_rel, .acquire) == null;
                     if (canEnqueue) {
                         cell.data = value;
                         cell.seq.store(pos + 1, .release);
@@ -72,17 +71,18 @@ pub fn BoundedQueue(comptime T: type) type {
 
         pub fn tryDequeue(self: *Self) ?T {
             while (true) {
-                const pos = self.dequeue_pos.load(.acquire);
+                const pos = self.tail.load(.acquire);
                 const idx = (@as(usize, pos) & self.mask);
                 var cell = &self.buffer[idx];
                 const seq = cell.seq.load(.acquire);
                 const expected = pos + 1;
 
                 if (seq == expected) {
-                    const canDequeue = self.dequeue_pos.cmpxchgWeak(pos, pos + 1, .acq_rel, .acquire) == null;
+                    const canDequeue = self.tail.cmpxchgWeak(pos, pos + 1, .acq_rel, .acquire) == null;
                     if (canDequeue) {
+                        const ret = cell.data;
                         cell.seq.store(pos + @as(u64, self.capacity), .release);
-                        return cell.data;
+                        return ret;
                     }
                 } else if (seq < expected) {
                     // No item yet (empty)
@@ -109,8 +109,8 @@ pub fn BoundedQueue(comptime T: type) type {
         }
 
         pub fn count(self: *Self) usize {
-            const enq = self.enqueue_pos.load(.acquire);
-            const deq = self.dequeue_pos.load(.acquire);
+            const enq = self.head.load(.acquire);
+            const deq = self.tail.load(.acquire);
             return @as(usize, enq - deq);
         }
     };
@@ -204,39 +204,43 @@ test "BoundedQueue concurrent operations" {
     const allocator = testing.allocator;
     const Thread = std.Thread;
 
-    const Queue = BoundedQueue(u64);
-    var queue = try Queue.init(allocator, 16);
-    defer queue.deinit(allocator);
+    for (0..100) |_| {
+        const Queue = BoundedQueue(u64);
+        var queue = try Queue.init(allocator, 16);
+        defer queue.deinit(allocator);
 
-    const num_items = 1000;
+        const num_items = 1000;
 
-    // Producer thread
-    const producer = try Thread.spawn(.{}, struct {
-        fn f(q: *Queue) void {
-            for (0..num_items) |i| {
-                q.enqueue(@as(u64, i));
+        // Producer thread
+        const producer = try Thread.spawn(.{}, struct {
+            fn f(q: *Queue) void {
+                for (0..num_items) |i| {
+                    q.enqueue(@as(u64, i));
+                }
             }
-        }
-    }.f, .{queue});
+        }.f, .{queue});
 
-    // Consumer thread
-    const consumer = try Thread.spawn(.{}, struct {
-        fn f(q: *Queue) void {
-            var sum: u64 = 0;
-            for (0..num_items) |_| {
-                sum +%= q.dequeue();
-            }
-            // Verify we got all items (sum of 0..999)
-            const expected_sum = (num_items * (num_items - 1)) / 2;
-            if (sum != expected_sum) {
-                std.debug.print("Sum mismatch: got {}, expected {}\n", .{ sum, expected_sum });
-                std.process.exit(1);
-            }
-        }
-    }.f, .{queue});
+        // Consumer thread
+        const consumer = try Thread.spawn(.{}, struct {
+            fn f(q: *Queue) !void {
+                errdefer std.process.exit(1);
+                errdefer std.debug.print("BoundedQueue concurrent test iteration failed\n", .{});
 
-    producer.join();
-    consumer.join();
+                var sum: u64 = 0;
+                for (0..num_items) |i| {
+                    const j = q.dequeue();
+                    sum +%= j;
+                    try testing.expectEqual(@as(u64, i), j);
+                }
+                // Verify we got all items (sum of 0..999)
+                const expected_sum = (num_items * (num_items - 1)) / 2;
+                try testing.expectEqual(@as(u64, expected_sum), sum);
+            }
+        }.f, .{queue});
+
+        producer.join();
+        consumer.join();
+    }
 }
 
 test "BoundedQueue different types" {

@@ -67,12 +67,14 @@ pub fn Chan(comptime T: type) type {
         closed: std.atomic.Value(bool) align(64) = .init(false),
 
         queue: *queue.BoundedQueue(T),
+        unbuffered: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, capacity: usize) !Pipe {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             self.* = .{
-                .queue = try queue.BoundedQueue(T).init(allocator, capacity),
+                .queue = try queue.BoundedQueue(T).init(allocator, @max(capacity, 2)),
+                .unbuffered = capacity == 0,
             };
 
             return .{
@@ -100,10 +102,20 @@ pub fn Chan(comptime T: type) type {
         }
 
         fn send(self: *Self, v: T) void {
+            const ack_snapshot = if (self.unbuffered) self.tx_key.load(.acquire) else 0;
             var spins: u32 = 1;
+
             while (true) {
                 if (self.queue.tryEnqueue(v)) {
-                    self.notifyReceiver();
+                    if (self.unbuffered) {
+                        _ = self.tx_waits.fetchAdd(1, .acq_rel);
+                        defer _ = self.tx_waits.fetchSub(1, .release);
+
+                        self.notifyReceiver();
+                        std.Thread.Futex.wait(@ptrCast(&self.tx_key), ack_snapshot);
+                    } else {
+                        self.notifyReceiver();
+                    }
                     return;
                 }
 
@@ -118,22 +130,26 @@ pub fn Chan(comptime T: type) type {
                 spins = 1;
 
                 _ = self.tx_waits.fetchAdd(1, .acq_rel);
+                defer _ = self.tx_waits.fetchSub(1, .release);
 
                 const key_snapshot = self.tx_key.load(.acquire);
 
                 if (self.queue.tryEnqueue(v)) {
-                    _ = self.tx_waits.fetchSub(1, .release);
-                    return self.notifyReceiver();
+                    self.notifyReceiver();
+                    if (self.unbuffered) {
+                        std.Thread.Futex.wait(@ptrCast(&self.tx_key), ack_snapshot);
+                    }
+                    return;
                 }
 
                 // NOTE: --> if receiver recv something here, futex will not sleep, because key changed
                 std.Thread.Futex.wait(@ptrCast(&self.tx_key), key_snapshot);
-                _ = self.tx_waits.fetchSub(1, .release);
             }
         }
 
         fn recv(self: *Self) ?T {
             var spins: u32 = 1;
+
             while (true) {
                 if (self.queue.tryDequeue()) |value| {
                     self.notifySender();
@@ -153,6 +169,8 @@ pub fn Chan(comptime T: type) type {
                 spins = 1;
 
                 _ = self.rx_waits.fetchAdd(1, .acq_rel);
+                defer _ = self.rx_waits.fetchSub(1, .release);
+
                 const key_snapshot = self.rx_key.load(.acquire);
 
                 // double-check after incrementing waiters
@@ -169,7 +187,6 @@ pub fn Chan(comptime T: type) type {
 
                 // NOTE: --> if sender send something here, futex will not sleep, because key changed
                 std.Thread.Futex.wait(@ptrCast(&self.rx_key), key_snapshot);
-                _ = self.rx_waits.fetchSub(1, .release);
             }
         }
 
@@ -220,6 +237,33 @@ test "basic send and receive" {
     try testing.expectEqual(@as(i32, 1), pair.rx.recv());
     try testing.expectEqual(@as(i32, 2), pair.rx.recv());
     try testing.expectEqual(@as(i32, 3), pair.rx.recv());
+}
+
+test "unbuffered channel" {
+    const allocator = std.testing.allocator;
+
+    for (0..100) |_| {
+        var pair = try Chan(i32).init(allocator, 0);
+        defer pair.deinit(allocator);
+
+        var sent_value: i32 = 0;
+
+        // Spawn a thread to send a value
+        const sender = try std.Thread.spawn(.{}, struct {
+            fn f(ally: std.mem.Allocator, tx: Sender(i32), val: *i32) void {
+                defer tx.deinit(ally);
+                tx.send(99);
+                val.* = 99;
+            }
+        }.f, .{ allocator, pair.tx.clone(), &sent_value });
+
+        // Receive the value in the main thread
+        const received = pair.rx.recv();
+        try testing.expectEqual(@as(i32, 99), received.?);
+
+        sender.join();
+        try testing.expectEqual(@as(i32, 99), sent_value);
+    }
 }
 
 test "channel cloning" {
@@ -302,48 +346,50 @@ test "different types" {
 
 test "concurrent send and receive" {
     const allocator = std.testing.allocator;
-    var pipe = try Chan(u64).init(allocator, 100);
+    for (0..100) |_| {
+        var pipe = try Chan(u64).init(allocator, 100);
 
-    const num_items = 1000;
+        const num_items = 1000;
 
-    // Shared result storage
-    var recv_sum: u64 = 0;
+        // Shared result storage
+        var recv_sum: u64 = 0;
 
-    // Spawn sender thread
-    const sender = try std.Thread.spawn(.{}, struct {
-        fn f(ally: std.mem.Allocator, tx: Sender(u64)) void {
-            defer tx.deinit(ally);
-            for (0..num_items) |i| {
-                tx.send(@as(u64, i));
-            }
-        }
-    }.f, .{ allocator, pipe.tx.clone() });
-
-    // Spawn receiver thread
-    const receiver = try std.Thread.spawn(.{}, struct {
-        fn f(ally: std.mem.Allocator, rx: Receiver(u64), sum: *u64) void {
-            defer rx.deinit(ally);
-
-            var local_sum: u64 = 0;
-            var received_count: usize = 0;
-
-            while (received_count < num_items) {
-                if (rx.recv()) |value| {
-                    local_sum +%= value;
-                    received_count += 1;
+        // Spawn sender thread
+        const sender = try std.Thread.spawn(.{}, struct {
+            fn f(ally: std.mem.Allocator, tx: Sender(u64)) void {
+                defer tx.deinit(ally);
+                for (0..num_items) |i| {
+                    tx.send(@as(u64, i));
                 }
             }
-            sum.* = local_sum;
-        }
-    }.f, .{ allocator, pipe.rx.clone(), &recv_sum });
+        }.f, .{ allocator, pipe.tx.clone() });
 
-    pipe.deinit(allocator);
-    sender.join();
-    receiver.join();
+        // Spawn receiver thread
+        const receiver = try std.Thread.spawn(.{}, struct {
+            fn f(ally: std.mem.Allocator, rx: Receiver(u64), sum: *u64) void {
+                defer rx.deinit(ally);
 
-    // Verify we received all items with correct sum
-    const expected_sum = (num_items * (num_items - 1)) / 2;
-    try testing.expectEqual(expected_sum, recv_sum);
+                var local_sum: u64 = 0;
+                var received_count: usize = 0;
+
+                while (received_count < num_items) {
+                    if (rx.recv()) |value| {
+                        local_sum +%= value;
+                        received_count += 1;
+                    }
+                }
+                sum.* = local_sum;
+            }
+        }.f, .{ allocator, pipe.rx.clone(), &recv_sum });
+
+        pipe.deinit(allocator);
+        sender.join();
+        receiver.join();
+
+        // Verify we received all items with correct sum
+        const expected_sum = (num_items * (num_items - 1)) / 2;
+        try testing.expectEqual(expected_sum, recv_sum);
+    }
 }
 
 test "stress test high contention" {
