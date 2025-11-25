@@ -3,30 +3,32 @@ const queue = @import("queue.zig");
 const testing = std.testing;
 const ChanErr = @import("errs.zig").ChanErr;
 
-pub fn Receiver(comptime T: type) type {
-    return struct {
-        ch: *const Chan(T),
+pub const ChanKind = enum {
+    MPMC,
+    MPSC,
+    SPSC,
+};
 
-        pub fn recv(self: @This()) ?T {
-            return @constCast(self.ch).recv();
-        }
-        pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-            @constCast(self.ch).release(allocator);
-        }
-        pub fn clone(self: @This()) @This() {
-            _ = @constCast(self.ch).ref_cnt.fetchAdd(1, .acq_rel);
-            return self;
-        }
+fn QueueType(comptime T: type, comptime kind: ChanKind) type {
+    return switch (kind) {
+        .MPMC => queue.Bounded(T, true, true),
+        .MPSC => queue.Bounded(T, true, false),
+        .SPSC => queue.Bounded(T, false, false),
     };
 }
 
-pub fn Sender(comptime T: type) type {
+pub const Options = struct {
+    kind: ChanKind = .MPMC,
+};
+
+pub fn Sender(comptime T: type, comptime opts: Options) type {
     return struct {
-        ch: *const Chan(T),
+        ch: *const Bounded(T, opts),
 
         pub fn send(self: @This(), v: T) void {
             return @constCast(self.ch).send(v);
         }
+
         pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
             const p = @constCast(self.ch);
             if (p.tx_ref_cnt.fetchSub(1, .acq_rel) == 1) {
@@ -34,6 +36,7 @@ pub fn Sender(comptime T: type) type {
             }
             p.release(allocator);
         }
+
         pub fn clone(self: @This()) @This() {
             const p = @constCast(self.ch);
             _ = p.ref_cnt.fetchAdd(1, .acq_rel);
@@ -43,12 +46,31 @@ pub fn Sender(comptime T: type) type {
     };
 }
 
-pub fn Chan(comptime T: type) type {
+pub fn Receiver(comptime T: type, comptime opts: Options) type {
+    return struct {
+        ch: *const Bounded(T, opts),
+
+        pub fn recv(self: @This()) ?T {
+            return @constCast(self.ch).recv();
+        }
+
+        pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+            @constCast(self.ch).release(allocator);
+        }
+
+        pub fn clone(self: @This()) @This() {
+            _ = @constCast(self.ch).ref_cnt.fetchAdd(1, .acq_rel);
+            return self;
+        }
+    };
+}
+
+pub fn Bounded(comptime T: type, comptime opts: Options) type {
     return struct {
         const Self = @This();
         const Pipe = struct {
-            tx: Sender(T),
-            rx: Receiver(T),
+            tx: Sender(T, opts),
+            rx: Receiver(T, opts),
 
             pub fn deinit(self: *Pipe, allocator: std.mem.Allocator) void {
                 self.tx.deinit(allocator);
@@ -66,14 +88,14 @@ pub fn Chan(comptime T: type) type {
 
         closed: std.atomic.Value(bool) align(64) = .init(false),
 
-        queue: *queue.BoundedQueue(T),
+        queue: *QueueType(T, opts.kind),
         unbuffered: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, capacity: usize) !Pipe {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             self.* = .{
-                .queue = try queue.BoundedQueue(T).init(allocator, @max(capacity, 2)),
+                .queue = try QueueType(T, opts.kind).init(allocator, @max(capacity, 2)),
                 .unbuffered = capacity == 0,
             };
 
@@ -216,13 +238,13 @@ pub fn Chan(comptime T: type) type {
 
 test "init and deinit chan" {
     const allocator = std.testing.allocator;
-    var pair = try Chan(i32).init(allocator, 10);
+    var pair = try Bounded(i32, .{}).init(allocator, 10);
     pair.deinit(allocator);
 }
 
 test "basic send and receive" {
     const allocator = std.testing.allocator;
-    var pair = try Chan(i32).init(allocator, 5);
+    var pair = try Bounded(i32, .{}).init(allocator, 5);
     defer pair.deinit(allocator);
 
     // Test basic send/receive
@@ -243,14 +265,14 @@ test "unbuffered channel" {
     const allocator = std.testing.allocator;
 
     for (0..100) |_| {
-        var pair = try Chan(i32).init(allocator, 0);
+        var pair = try Bounded(i32, .{}).init(allocator, 0);
         defer pair.deinit(allocator);
 
         var sent_value: i32 = 0;
 
         // Spawn a thread to send a value
         const sender = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, tx: Sender(i32), val: *i32) void {
+            fn f(ally: std.mem.Allocator, tx: Sender(i32, .{}), val: *i32) void {
                 defer tx.deinit(ally);
                 tx.send(99);
                 val.* = 99;
@@ -268,7 +290,7 @@ test "unbuffered channel" {
 
 test "channel cloning" {
     const allocator = std.testing.allocator;
-    var pair = try Chan(i32).init(allocator, 5);
+    var pair = try Bounded(i32, .{}).init(allocator, 5);
     defer pair.deinit(allocator);
 
     // Clone sender
@@ -286,7 +308,7 @@ test "channel cloning" {
 
 test "channel closing" {
     const allocator = std.testing.allocator;
-    var pair = try Chan(i32).init(allocator, 5);
+    var pair = try Bounded(i32, .{}).init(allocator, 5);
 
     // Release sender (this should close the channel)
     pair.tx.deinit(allocator);
@@ -300,7 +322,7 @@ test "channel closing" {
 
 test "multiple senders closing" {
     const allocator = std.testing.allocator;
-    var pair = try Chan(i32).init(allocator, 5);
+    var pair = try Bounded(i32, .{}).init(allocator, 5);
 
     // Clone sender multiple times
     var tx2 = pair.tx.clone();
@@ -328,7 +350,7 @@ test "different types" {
 
     // Test with different types
     {
-        var pair = try Chan(f64).init(allocator, 5);
+        var pair = try Bounded(f64, .{}).init(allocator, 5);
         defer pair.deinit(allocator);
 
         pair.tx.send(3.14);
@@ -336,7 +358,7 @@ test "different types" {
     }
 
     {
-        var pair = try Chan([]const u8).init(allocator, 5);
+        var pair = try Bounded([]const u8, .{}).init(allocator, 5);
         defer pair.deinit(allocator);
 
         pair.tx.send("hello");
@@ -347,7 +369,7 @@ test "different types" {
 test "concurrent send and receive" {
     const allocator = std.testing.allocator;
     for (0..100) |_| {
-        var pipe = try Chan(u64).init(allocator, 100);
+        var pipe = try Bounded(u64, .{}).init(allocator, 100);
 
         const num_items = 1000;
 
@@ -356,7 +378,7 @@ test "concurrent send and receive" {
 
         // Spawn sender thread
         const sender = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, tx: Sender(u64)) void {
+            fn f(ally: std.mem.Allocator, tx: Sender(u64, .{})) void {
                 defer tx.deinit(ally);
                 for (0..num_items) |i| {
                     tx.send(@as(u64, i));
@@ -366,7 +388,7 @@ test "concurrent send and receive" {
 
         // Spawn receiver thread
         const receiver = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, rx: Receiver(u64), sum: *u64) void {
+            fn f(ally: std.mem.Allocator, rx: Receiver(u64, .{}), sum: *u64) void {
                 defer rx.deinit(ally);
 
                 var local_sum: u64 = 0;
@@ -394,7 +416,7 @@ test "concurrent send and receive" {
 
 test "stress test high contention" {
     const allocator = std.testing.allocator;
-    var pipe = try Chan(u16).init(allocator, 5); // Small buffer to create contention
+    var pipe = try Bounded(u16, .{}).init(allocator, 5); // Small buffer to create contention
 
     const num_threads = 10;
     const operations_per_sender = 100;
@@ -407,7 +429,7 @@ test "stress test high contention" {
     var threads: [num_threads]std.Thread = undefined;
     for (0..num_threads) |i| {
         threads[i] = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, tx: Sender(u16), rx: Receiver(u16), sent: *std.atomic.Value(u32), received: *std.atomic.Value(u32), idx: usize) void {
+            fn f(ally: std.mem.Allocator, tx: Sender(u16, .{}), rx: Receiver(u16, .{}), sent: *std.atomic.Value(u32), received: *std.atomic.Value(u32), idx: usize) void {
                 if (idx % 3 > 0) {
                     // Even indexed threads send first
                     rx.deinit(ally); // Even indexed threads send first

@@ -1,7 +1,7 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
 
-pub const Chan = @import("chan/chan.zig").Chan;
+pub const Bounded = @import("chan/chan.zig").Bounded;
 pub const ChanErr = @import("chan/errs.zig").ChanErr;
 
 test {

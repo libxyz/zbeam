@@ -4,7 +4,7 @@ const QueueError = error{
     Closed,
 };
 
-pub fn BoundedQueue(comptime T: type) type {
+pub fn Bounded(comptime T: type, comptime mp: bool, comptime mc: bool) type {
     return struct {
         const Self = @This();
 
@@ -18,8 +18,8 @@ pub fn BoundedQueue(comptime T: type) type {
         capacity: usize,
         mask: usize,
         buffer: []Slot,
-        head: std.atomic.Value(u64) align(64) = .init(0),
-        tail: std.atomic.Value(u64) align(64) = .init(0),
+        head: u64 align(64) = 0,
+        tail: u64 align(64) = 0,
 
         pub fn init(alloc: std.mem.Allocator, cap: usize) !*Self {
             const real_cap = std.math.ceilPowerOfTwo(usize, cap) catch unreachable;
@@ -50,14 +50,13 @@ pub fn BoundedQueue(comptime T: type) type {
         pub fn tryEnqueue(self: *Self, value: T) bool {
             // Attempt to reserve a position if available by reading enqueue_pos and checking slot seq
             while (true) {
-                const pos = self.head.load(.acquire);
+                const pos = self.loadHead();
                 const idx = (@as(usize, pos) & self.mask);
                 var cell = &self.buffer[idx];
                 const seq = cell.seq.load(.acquire);
 
                 if (seq == pos) {
-                    const canEnqueue = self.head.cmpxchgWeak(pos, pos + 1, .acq_rel, .acquire) == null;
-                    if (canEnqueue) {
+                    if (self.canEnqueue(pos)) {
                         cell.data = value;
                         cell.seq.store(pos + 1, .release);
                         return true;
@@ -71,15 +70,14 @@ pub fn BoundedQueue(comptime T: type) type {
 
         pub fn tryDequeue(self: *Self) ?T {
             while (true) {
-                const pos = self.tail.load(.acquire);
+                const pos = self.loadTail();
                 const idx = (@as(usize, pos) & self.mask);
                 var cell = &self.buffer[idx];
                 const seq = cell.seq.load(.acquire);
                 const expected = pos + 1;
 
                 if (seq == expected) {
-                    const canDequeue = self.tail.cmpxchgWeak(pos, pos + 1, .acq_rel, .acquire) == null;
-                    if (canDequeue) {
+                    if (self.canDequeue(pos)) {
                         const ret = cell.data;
                         cell.seq.store(pos + @as(u64, self.capacity), .release);
                         return ret;
@@ -108,19 +106,56 @@ pub fn BoundedQueue(comptime T: type) type {
             }
         }
 
-        pub fn count(self: *Self) usize {
-            const enq = self.head.load(.acquire);
-            const deq = self.tail.load(.acquire);
-            return @as(usize, enq - deq);
+        pub fn len(self: *Self) usize {
+            return @as(usize, self.loadHead() - self.loadTail());
+        }
+
+        inline fn loadHead(self: *Self) u64 {
+            if (mp) {
+                return @atomicLoad(u64, &self.head, .acquire);
+            } else {
+                return self.head;
+            }
+        }
+
+        inline fn loadTail(self: *Self) u64 {
+            if (mc) {
+                return @atomicLoad(u64, &self.tail, .acquire);
+            } else {
+                return self.tail;
+            }
+        }
+
+        inline fn canEnqueue(self: *Self, old: u64) bool {
+            if (mp) {
+                return @cmpxchgWeak(u64, &self.head, old, old + 1, .acq_rel, .acquire) == null;
+            } else {
+                self.head = old + 1;
+                return true;
+            }
+        }
+
+        inline fn canDequeue(self: *Self, old: u64) bool {
+            if (mc) {
+                return @cmpxchgWeak(u64, &self.tail, old, old + 1, .acq_rel, .acquire) == null;
+            } else {
+                self.tail = old + 1;
+                return true;
+            }
         }
     };
+}
+
+/// for test
+fn Mpmc(comptime T: type) type {
+    return Bounded(T, true, true);
 }
 
 test "BoundedQueue basic operations" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const Queue = BoundedQueue(u64);
+    const Queue = Mpmc(u64);
     var queue = try Queue.init(allocator, 8);
     defer queue.deinit(allocator);
 
@@ -138,7 +173,7 @@ test "BoundedQueue try operations" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const Queue = BoundedQueue(u64);
+    const Queue = Mpmc(u64);
     var queue = try Queue.init(allocator, 8);
     defer queue.deinit(allocator);
 
@@ -163,13 +198,15 @@ test "BoundedQueue try operations" {
 
     // Queue should be full now (8 items total)
     try testing.expect(!queue.tryEnqueue(11));
+
+    try testing.expectEqual(queue.len(), 8);
 }
 
 test "BoundedQueue empty queue behavior" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const Queue = BoundedQueue(u64);
+    const Queue = Mpmc(u64);
     var queue = try Queue.init(allocator, 4);
     defer queue.deinit(allocator);
 
@@ -181,7 +218,7 @@ test "BoundedQueue wraparound" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const Queue = BoundedQueue(u64);
+    const Queue = Mpmc(u64);
     var queue = try Queue.init(allocator, 4);
     defer queue.deinit(allocator);
 
@@ -205,7 +242,7 @@ test "BoundedQueue concurrent operations" {
     const Thread = std.Thread;
 
     for (0..100) |_| {
-        const Queue = BoundedQueue(u64);
+        const Queue = Mpmc(u64);
         var queue = try Queue.init(allocator, 16);
         defer queue.deinit(allocator);
 
@@ -240,6 +277,7 @@ test "BoundedQueue concurrent operations" {
 
         producer.join();
         consumer.join();
+        try testing.expectEqual(queue.len(), 0);
     }
 }
 
@@ -247,7 +285,7 @@ test "BoundedQueue different types" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const Queue = BoundedQueue(i32);
+    const Queue = Mpmc(i32);
     var queue = try Queue.init(allocator, 4);
     defer queue.deinit(allocator);
 
@@ -265,7 +303,7 @@ test "BoundedQueue capacity rounding" {
     const allocator = testing.allocator;
 
     // Test that capacity is rounded up to power of 2
-    const Queue = BoundedQueue(u64);
+    const Queue = Mpmc(u64);
     var queue = try Queue.init(allocator, 5); // Should round up to 8
     defer queue.deinit(allocator);
 
@@ -287,7 +325,7 @@ test "BoundedQueue single producer multiple consumers" {
     const allocator = testing.allocator;
     const Thread = std.Thread;
 
-    const Queue = BoundedQueue(u64);
+    const Queue = Mpmc(u64);
     var queue = try Queue.init(allocator, 32);
     defer queue.deinit(allocator);
 
