@@ -2,6 +2,9 @@
 const std = @import("std");
 
 pub const Bounded = @import("chan/chan.zig").Bounded;
+pub const Receiver = @import("chan/chan.zig").Receiver;
+pub const Sender = @import("chan/chan.zig").Sender;
+
 pub const ChanErr = @import("chan/errs.zig").ChanErr;
 
 test {
