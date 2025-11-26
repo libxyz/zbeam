@@ -1,4 +1,6 @@
+# zbeam
+
 ## TODO
 
 - Bugs
-  - [ ] chan may block forever in test "test high contenti..."
+  - [x] chan may block forever in test "test high contenti..."

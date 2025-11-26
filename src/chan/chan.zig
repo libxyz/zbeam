@@ -241,13 +241,11 @@ pub fn Bounded(comptime T: type, comptime opts: Options) type {
 
                 // double-check after incrementing waiters
                 if (self.queue.tryDequeue()) |value| {
-                    _ = self.rx_waits.fetchSub(1, .release);
                     self.notifySender();
                     return value;
                 }
 
                 if (self.closed.load(.acquire)) {
-                    _ = self.rx_waits.fetchSub(1, .release);
                     return null;
                 }
 
