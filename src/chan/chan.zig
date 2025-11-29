@@ -21,35 +21,31 @@ pub const Options = struct {
     kind: ChanKind = .MPMC,
 };
 
-pub fn Sender(comptime T: type) type {
+pub fn Sender(comptime T: type, comptime opts: Options) type {
     return struct {
-        const VTable = struct {
-            send: *const fn (self: *anyopaque, v: T) void,
-            close: *const fn (self: *anyopaque) void,
-            deinit: *const fn (self: *anyopaque, allocator: std.mem.Allocator) void,
-        };
-
-        ctx: *anyopaque,
-        vtable: *const VTable,
+        ch: *Bounded(T, opts),
         ref_cnt: *std.atomic.Value(usize) align(64),
         tx_ref_cnt: *std.atomic.Value(usize) align(64),
 
         pub fn send(self: @This(), v: T) void {
-            return self.vtable.send(self.ctx, v);
+            return self.ch.send(v);
         }
 
         pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
             if (self.tx_ref_cnt.fetchSub(1, .acq_rel) == 1) {
-                self.vtable.close(self.ctx);
+                self.ch.close();
                 allocator.destroy(self.tx_ref_cnt);
             }
             if (self.ref_cnt.fetchSub(1, .acq_rel) == 1) {
-                self.vtable.deinit(self.ctx, allocator);
+                self.ch.deinit(allocator);
                 allocator.destroy(self.ref_cnt);
             }
         }
 
         pub fn clone(self: @This()) @This() {
+            if (opts.kind == .SPSC) {
+                @compileError("SPSC channels do not support cloning the sender");
+            }
             _ = self.ref_cnt.fetchAdd(1, .acq_rel);
             _ = self.tx_ref_cnt.fetchAdd(1, .acq_rel);
             return self;
@@ -57,29 +53,26 @@ pub fn Sender(comptime T: type) type {
     };
 }
 
-pub fn Receiver(comptime T: type) type {
+pub fn Receiver(comptime T: type, comptime opts: Options) type {
     return struct {
-        const VTable = struct {
-            recv: *const fn (self: *anyopaque) ?T,
-            deinit: *const fn (self: *anyopaque, allocator: std.mem.Allocator) void,
-        };
-
-        ctx: *anyopaque,
-        vtable: *const VTable,
+        ch: *Bounded(T, opts),
         ref_cnt: *std.atomic.Value(usize) align(64),
 
         pub fn recv(self: @This()) ?T {
-            return self.vtable.recv(self.ctx);
+            return self.ch.recv();
         }
 
         pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
             if (self.ref_cnt.fetchSub(1, .acq_rel) == 1) {
-                self.vtable.deinit(self.ctx, allocator);
+                self.ch.deinit(allocator);
                 allocator.destroy(self.ref_cnt);
             }
         }
 
         pub fn clone(self: @This()) @This() {
+            if (opts.kind == .SPSC or opts.kind == .MPSC) {
+                @compileError("SPSC channels do not support cloning the receiver");
+            }
             _ = self.ref_cnt.fetchAdd(1, .acq_rel);
             return self;
         }
@@ -90,8 +83,8 @@ pub fn Bounded(comptime T: type, comptime opts: Options) type {
     return struct {
         const Self = @This();
         const Pipe = struct {
-            tx: Sender(T),
-            rx: Receiver(T),
+            tx: Sender(T, opts),
+            rx: Receiver(T, opts),
 
             pub fn deinit(self: *Pipe, allocator: std.mem.Allocator) void {
                 self.tx.deinit(allocator);
@@ -101,15 +94,6 @@ pub fn Bounded(comptime T: type, comptime opts: Options) type {
 
         const MAX_SPINS: u32 = 512;
 
-        const tx_vtable = &Sender(T).VTable{
-            .send = send,
-            .close = close,
-            .deinit = deinit,
-        };
-        const rx_vtable = &Receiver(T).VTable{
-            .recv = recv,
-            .deinit = deinit,
-        };
 
         tx_waits: std.atomic.Value(u32) align(64) = .init(0),
         rx_waits: std.atomic.Value(u32) align(64) = .init(0),
@@ -139,34 +123,29 @@ pub fn Bounded(comptime T: type, comptime opts: Options) type {
 
             return .{
                 .tx = .{
-                    .ctx = self,
-                    .vtable = tx_vtable,
+                    .ch = self,
                     .ref_cnt = ref_cnt,
                     .tx_ref_cnt = tx_ref_cnt,
                 },
                 .rx = .{
-                    .ctx = self,
-                    .vtable = rx_vtable,
+                    .ch = self,
                     .ref_cnt = ref_cnt,
                 },
             };
         }
 
-        fn deinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.queue.deinit(allocator);
             allocator.destroy(self);
         }
 
-        fn close(ctx: *anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
+        pub fn close(self: *Self) void {
             self.closed.store(true, .release);
             self.wakeAll(&self.rx_key, &self.rx_waits);
             self.wakeAll(&self.tx_key, &self.tx_waits); // optional for robustness
         }
 
-        fn send(ctx: *anyopaque, v: T) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
+        pub fn send(self: *Self, v: T) void {
             const ack_snapshot = if (self.unbuffered) self.tx_key.load(.acquire) else 0;
             var spins: u32 = 1;
 
@@ -212,8 +191,7 @@ pub fn Bounded(comptime T: type, comptime opts: Options) type {
             }
         }
 
-        fn recv(ctx: *anyopaque) ?T {
-            const self: *Self = @ptrCast(@alignCast(ctx));
+        pub fn recv(self: *Self) ?T {
             var spins: u32 = 1;
 
             while (true) {
@@ -314,7 +292,7 @@ test "unbuffered channel" {
 
         // Spawn a thread to send a value
         const sender = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, tx: Sender(i32), val: *i32) void {
+            fn f(ally: std.mem.Allocator, tx: Sender(i32, .{}), val: *i32) void {
                 defer tx.deinit(ally);
                 tx.send(99);
                 val.* = 99;
@@ -420,7 +398,7 @@ test "concurrent send and receive" {
 
         // Spawn sender thread
         const sender = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, tx: Sender(u64)) void {
+            fn f(ally: std.mem.Allocator, tx: Sender(u64, .{})) void {
                 defer tx.deinit(ally);
                 for (0..num_items) |i| {
                     tx.send(@as(u64, i));
@@ -430,7 +408,7 @@ test "concurrent send and receive" {
 
         // Spawn receiver thread
         const receiver = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, rx: Receiver(u64), sum: *u64) void {
+            fn f(ally: std.mem.Allocator, rx: Receiver(u64, .{}), sum: *u64) void {
                 defer rx.deinit(ally);
 
                 var local_sum: u64 = 0;
@@ -471,7 +449,7 @@ test "stress test high contention" {
     var threads: [num_threads]std.Thread = undefined;
     for (0..num_threads) |i| {
         threads[i] = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, tx: Sender(u16), rx: Receiver(u16), sent: *std.atomic.Value(u32), received: *std.atomic.Value(u32), idx: usize) void {
+            fn f(ally: std.mem.Allocator, tx: Sender(u16, .{}), rx: Receiver(u16, .{}), sent: *std.atomic.Value(u32), received: *std.atomic.Value(u32), idx: usize) void {
                 if (idx % 3 > 0) {
                     // Even indexed threads send first
                     rx.deinit(ally); // Even indexed threads send first

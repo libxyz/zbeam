@@ -89,15 +89,13 @@ pub fn Bounded(comptime T: type, comptime mp: bool, comptime mc: bool) type {
             }
         }
 
-        /// for test
-        fn enqueue(self: *Self, value: T) void {
+        pub fn enqueue(self: *Self, value: T) void {
             while (!self.tryEnqueue(value)) {
                 std.atomic.spinLoopHint();
             }
         }
 
-        /// for test
-        fn dequeue(self: *Self) T {
+        pub fn dequeue(self: *Self) T {
             while (true) {
                 if (self.tryDequeue()) |value| {
                     return value;
