@@ -153,6 +153,24 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
-    const zbench = b.dependency("zbench", .{});
-    exe.root_module.addImport("zbench", zbench.module("zbench"));
+    // const zbench = b.dependency("zbench", .{});
+    // exe.root_module.addImport("zbench", zbench.module("zbench"));
+
+    // Create benchmark executable
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zbeam", .module = mod },
+            },
+        }),
+    });
+
+    // Create a step to run the benchmarks
+    const bench_step = b.step("bench", "Run benchmarks");
+    const run_bench_cmd = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&run_bench_cmd.step);
 }
