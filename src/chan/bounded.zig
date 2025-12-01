@@ -82,18 +82,10 @@ pub fn Receiver(comptime T: type, comptime opts: Options) type {
 pub fn Bounded(comptime T: type, comptime opts: Options) type {
     return struct {
         const Self = @This();
-        const Pipe = struct {
-            tx: Sender(T, opts),
-            rx: Receiver(T, opts),
-
-            pub fn deinit(self: *Pipe, allocator: std.mem.Allocator) void {
-                self.tx.deinit(allocator);
-                self.rx.deinit(allocator);
-            }
-        };
+        pub const Tx = Sender(T, opts);
+        pub const Rx = Receiver(T, opts);
 
         const MAX_SPINS: u32 = 512;
-
 
         tx_waits: std.atomic.Value(u32) align(64) = .init(0),
         rx_waits: std.atomic.Value(u32) align(64) = .init(0),
@@ -105,7 +97,7 @@ pub fn Bounded(comptime T: type, comptime opts: Options) type {
         queue: *QueueType(T, opts.kind),
         unbuffered: bool = false,
 
-        pub fn init(allocator: std.mem.Allocator, capacity: usize) !Pipe {
+        pub fn init(allocator: std.mem.Allocator, capacity: usize) !struct { Tx, Rx } {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             self.* = .{
@@ -122,12 +114,12 @@ pub fn Bounded(comptime T: type, comptime opts: Options) type {
             tx_ref_cnt.store(1, .monotonic); // one for tx
 
             return .{
-                .tx = .{
+                .{
                     .ch = self,
                     .ref_cnt = ref_cnt,
                     .tx_ref_cnt = tx_ref_cnt,
                 },
-                .rx = .{
+                .{
                     .ch = self,
                     .ref_cnt = ref_cnt,
                 },
@@ -258,49 +250,56 @@ pub fn Bounded(comptime T: type, comptime opts: Options) type {
 
 test "init and deinit chan" {
     const allocator = std.testing.allocator;
-    var pair = try Bounded(i32, .{}).init(allocator, 10);
-    pair.deinit(allocator);
+    const tx, const rx = try Bounded(i32, .{}).init(allocator, 10);
+    tx.deinit(allocator);
+    rx.deinit(allocator);
 }
 
 test "basic send and receive" {
     const allocator = std.testing.allocator;
-    var pair = try Bounded(i32, .{}).init(allocator, 5);
-    defer pair.deinit(allocator);
+    const tx, const rx = try Bounded(i32, .{}).init(allocator, 5);
+    defer {
+        tx.deinit(allocator);
+        rx.deinit(allocator);
+    }
 
     // Test basic send/receive
-    pair.tx.send(42);
-    try testing.expectEqual(@as(i32, 42), pair.rx.recv());
+    tx.send(42);
+    try testing.expectEqual(@as(i32, 42), rx.recv());
 
     // Test multiple sends/receives
-    pair.tx.send(1);
-    pair.tx.send(2);
-    pair.tx.send(3);
+    tx.send(1);
+    tx.send(2);
+    tx.send(3);
 
-    try testing.expectEqual(@as(i32, 1), pair.rx.recv());
-    try testing.expectEqual(@as(i32, 2), pair.rx.recv());
-    try testing.expectEqual(@as(i32, 3), pair.rx.recv());
+    try testing.expectEqual(@as(i32, 1), rx.recv());
+    try testing.expectEqual(@as(i32, 2), rx.recv());
+    try testing.expectEqual(@as(i32, 3), rx.recv());
 }
 
 test "unbuffered channel" {
     const allocator = std.testing.allocator;
 
     for (0..100) |_| {
-        var pair = try Bounded(i32, .{}).init(allocator, 0);
-        defer pair.deinit(allocator);
+        const tx, const rx = try Bounded(i32, .{}).init(allocator, 0);
+        defer {
+            tx.deinit(allocator);
+            rx.deinit(allocator);
+        }
 
         var sent_value: i32 = 0;
 
         // Spawn a thread to send a value
         const sender = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, tx: Sender(i32, .{}), val: *i32) void {
-                defer tx.deinit(ally);
-                tx.send(99);
+            fn f(ally: std.mem.Allocator, sender: Sender(i32, .{}), val: *i32) void {
+                defer sender.deinit(ally);
+                sender.send(99);
                 val.* = 99;
             }
-        }.f, .{ allocator, pair.tx.clone(), &sent_value });
+        }.f, .{ allocator, tx.clone(), &sent_value });
 
         // Receive the value in the main thread
-        const received = pair.rx.recv();
+        const received = rx.recv();
         try testing.expectEqual(@as(i32, 99), received.?);
 
         sender.join();
@@ -310,15 +309,18 @@ test "unbuffered channel" {
 
 test "channel cloning" {
     const allocator = std.testing.allocator;
-    var pair = try Bounded(i32, .{}).init(allocator, 5);
-    defer pair.deinit(allocator);
+    const tx, const rx = try Bounded(i32, .{}).init(allocator, 5);
+    defer {
+        tx.deinit(allocator);
+        rx.deinit(allocator);
+    }
 
     // Clone sender
-    var tx2 = pair.tx.clone();
+    var tx2 = tx.clone();
     defer tx2.deinit(allocator);
 
     // Clone receiver
-    var rx2 = pair.rx.clone();
+    var rx2 = rx.clone();
     defer rx2.deinit(allocator);
 
     // Test that cloned channels work
@@ -328,41 +330,41 @@ test "channel cloning" {
 
 test "channel closing" {
     const allocator = std.testing.allocator;
-    var pair = try Bounded(i32, .{}).init(allocator, 5);
+    const tx, const rx = try Bounded(i32, .{}).init(allocator, 5);
 
     // Release sender (this should close the channel)
-    pair.tx.deinit(allocator);
+    tx.deinit(allocator);
 
     // Try to receive from closed channel
-    try testing.expectEqual(@as(?i32, null), pair.rx.recv());
+    try testing.expectEqual(@as(?i32, null), rx.recv());
 
     // Now release receiver
-    pair.rx.deinit(allocator);
+    rx.deinit(allocator);
 }
 
 test "multiple senders closing" {
     const allocator = std.testing.allocator;
-    var pair = try Bounded(i32, .{}).init(allocator, 5);
+    const tx, const rx = try Bounded(i32, .{}).init(allocator, 5);
 
     // Clone sender multiple times
-    var tx2 = pair.tx.clone();
-    var tx3 = pair.tx.clone();
+    var tx2 = tx.clone();
+    var tx3 = tx.clone();
 
     // Release original sender
-    pair.tx.deinit(allocator);
+    tx.deinit(allocator);
 
     // Channel should still be open (tx2 and tx3 exist)
     tx2.send(42);
-    try testing.expectEqual(@as(i32, 42), pair.rx.recv());
+    try testing.expectEqual(@as(i32, 42), rx.recv());
 
     // Release all senders
     tx2.deinit(allocator);
     tx3.deinit(allocator);
 
     // Now channel should be closed
-    try testing.expectEqual(@as(?i32, null), pair.rx.recv());
+    try testing.expectEqual(@as(?i32, null), rx.recv());
 
-    pair.rx.deinit(allocator);
+    rx.deinit(allocator);
 }
 
 test "different types" {
@@ -370,26 +372,32 @@ test "different types" {
 
     // Test with different types
     {
-        var pair = try Bounded(f64, .{}).init(allocator, 5);
-        defer pair.deinit(allocator);
+        const tx, const rx = try Bounded(f64, .{}).init(allocator, 5);
+        defer {
+            tx.deinit(allocator);
+            rx.deinit(allocator);
+        }
 
-        pair.tx.send(3.14);
-        try testing.expectEqual(@as(f64, 3.14), pair.rx.recv());
+        tx.send(3.14);
+        try testing.expectEqual(@as(f64, 3.14), rx.recv());
     }
 
     {
-        var pair = try Bounded([]const u8, .{}).init(allocator, 5);
-        defer pair.deinit(allocator);
+        const tx, const rx = try Bounded([]const u8, .{}).init(allocator, 5);
+        defer {
+            tx.deinit(allocator);
+            rx.deinit(allocator);
+        }
 
-        pair.tx.send("hello");
-        try testing.expectEqualStrings("hello", pair.rx.recv().?);
+        tx.send("hello");
+        try testing.expectEqualStrings("hello", rx.recv().?);
     }
 }
 
 test "concurrent send and receive" {
     const allocator = std.testing.allocator;
     for (0..100) |_| {
-        var pipe = try Bounded(u64, .{}).init(allocator, 100);
+        const tx, const rx = try Bounded(u64, .{}).init(allocator, 100);
 
         const num_items = 1000;
 
@@ -398,33 +406,34 @@ test "concurrent send and receive" {
 
         // Spawn sender thread
         const sender = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, tx: Sender(u64, .{})) void {
-                defer tx.deinit(ally);
+            fn f(ally: std.mem.Allocator, sender: Sender(u64, .{})) void {
+                defer sender.deinit(ally);
                 for (0..num_items) |i| {
-                    tx.send(@as(u64, i));
+                    sender.send(@as(u64, i));
                 }
             }
-        }.f, .{ allocator, pipe.tx.clone() });
+        }.f, .{ allocator, tx.clone() });
 
         // Spawn receiver thread
         const receiver = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, rx: Receiver(u64, .{}), sum: *u64) void {
-                defer rx.deinit(ally);
+            fn f(ally: std.mem.Allocator, receiver: Receiver(u64, .{}), sum: *u64) void {
+                defer receiver.deinit(ally);
 
                 var local_sum: u64 = 0;
                 var received_count: usize = 0;
 
                 while (received_count < num_items) {
-                    if (rx.recv()) |value| {
+                    if (receiver.recv()) |value| {
                         local_sum +%= value;
                         received_count += 1;
                     }
                 }
                 sum.* = local_sum;
             }
-        }.f, .{ allocator, pipe.rx.clone(), &recv_sum });
+        }.f, .{ allocator, rx.clone(), &recv_sum });
 
-        pipe.deinit(allocator);
+        tx.deinit(allocator);
+        rx.deinit(allocator);
         sender.join();
         receiver.join();
 
@@ -436,7 +445,7 @@ test "concurrent send and receive" {
 
 test "stress test high contention" {
     const allocator = std.testing.allocator;
-    var pipe = try Bounded(u16, .{}).init(allocator, 5); // Small buffer to create contention
+    const tx, const rx = try Bounded(u16, .{}).init(allocator, 5); // Small buffer to create contention
 
     const num_threads = 10;
     const operations_per_sender = 100;
@@ -449,30 +458,31 @@ test "stress test high contention" {
     var threads: [num_threads]std.Thread = undefined;
     for (0..num_threads) |i| {
         threads[i] = try std.Thread.spawn(.{}, struct {
-            fn f(ally: std.mem.Allocator, tx: Sender(u16, .{}), rx: Receiver(u16, .{}), sent: *std.atomic.Value(u32), received: *std.atomic.Value(u32), idx: usize) void {
+            fn f(ally: std.mem.Allocator, sender: Sender(u16, .{}), receiver: Receiver(u16, .{}), sent: *std.atomic.Value(u32), received: *std.atomic.Value(u32), idx: usize) void {
                 if (idx % 3 > 0) {
                     // Even indexed threads send first
-                    rx.deinit(ally); // Even indexed threads send first
-                    defer tx.deinit(ally);
+                    receiver.deinit(ally); // Even indexed threads send first
+                    defer sender.deinit(ally);
 
                     for (0..operations_per_sender) |j| {
-                        tx.send(@intCast(j));
+                        sender.send(@intCast(j));
                         _ = sent.fetchAdd(1, .acq_rel);
                     }
                 } else {
-                    tx.deinit(ally); // Odd indexed threads receive first
-                    defer rx.deinit(ally);
+                    sender.deinit(ally); // Odd indexed threads receive first
+                    defer receiver.deinit(ally);
 
-                    while (rx.recv()) |_| {
+                    while (receiver.recv()) |_| {
                         _ = received.fetchAdd(1, .acq_rel);
                     }
                 }
             }
-        }.f, .{ allocator, pipe.tx.clone(), pipe.rx.clone(), &total_sent, &total_received, i });
+        }.f, .{ allocator, tx.clone(), rx.clone(), &total_sent, &total_received, i });
     }
 
     // Clean up original pipe
-    pipe.deinit(allocator);
+    tx.deinit(allocator);
+    rx.deinit(allocator);
 
     // Wait for all threads to finish
     for (&threads) |thread| {
